@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import os
+import re
+import select
+import struct
+import sys
+import threading
+import time
+
+EV_KEY = 1
+EVENT_STRUCT = struct.Struct('llHHi')
+
+PWM_DIR = os.environ.get('RUMBLE_PWM_DIR', '/sys/class/pwm/pwmchip1/pwm0')
+PERIOD = int(os.environ.get('RUMBLE_PERIOD', '20000000'))
+ACTIVE_DUTY = int(os.environ.get('RUMBLE_ACTIVE_DUTY', '10000000'))
+IDLE_DUTY = int(os.environ.get('RUMBLE_IDLE_DUTY', '20000000'))
+DEFAULT_MS = int(os.environ.get('RUMBLE_MS', '80'))
+COOLDOWN = float(os.environ.get('RUMBLE_COOLDOWN', '0.08'))
+FIFO = os.environ.get('RUMBLE_FIFO', '/tmp/stardew-rumble')
+
+# A/B/X/Y/L/R/L2/R2. Avoid dpad/start/select so normal movement does not rumble constantly.
+TRIGGER_KEYS = {304, 305, 307, 308, 310, 311, 312, 313}
+
+last_pulse = 0.0
+pulse_lock = threading.Lock()
+
+
+def log(msg):
+    print('rumble-helper: ' + msg, flush=True)
+
+
+def write_file(path, value):
+    with open(path, 'w', encoding='ascii') as f:
+        f.write(str(value))
+
+
+def setup_pwm():
+    if not os.path.isdir(PWM_DIR):
+        raise RuntimeError('PWM directory not found: ' + PWM_DIR)
+    period_path = os.path.join(PWM_DIR, 'period')
+    duty_path = os.path.join(PWM_DIR, 'duty_cycle')
+    enable_path = os.path.join(PWM_DIR, 'enable')
+    write_file(period_path, PERIOD)
+    write_file(duty_path, IDLE_DUTY)
+    write_file(enable_path, 1)
+    return duty_path, enable_path
+
+
+def pulse(ms=DEFAULT_MS, duty=ACTIVE_DUTY):
+    global last_pulse
+    now = time.monotonic()
+    with pulse_lock:
+        if now - last_pulse < COOLDOWN:
+            return
+        last_pulse = now
+        write_file(os.path.join(PWM_DIR, 'enable'), 0)
+        write_file(os.path.join(PWM_DIR, 'duty_cycle'), duty)
+        write_file(os.path.join(PWM_DIR, 'enable'), 1)
+    time.sleep(max(1, ms) / 1000.0)
+    with pulse_lock:
+        write_file(os.path.join(PWM_DIR, 'enable'), 0)
+        write_file(os.path.join(PWM_DIR, 'duty_cycle'), IDLE_DUTY)
+        write_file(os.path.join(PWM_DIR, 'enable'), 1)
+
+
+def pulse_async(ms=DEFAULT_MS, duty=ACTIVE_DUTY):
+    threading.Thread(target=pulse, args=(ms, duty), daemon=True).start()
+
+
+def find_joypad_event():
+    try:
+        text = open('/proc/bus/input/devices', 'r', encoding='utf-8', errors='replace').read()
+    except OSError:
+        return None
+    for block in text.strip().split('\n\n'):
+        if 'retrogame_joypad' not in block:
+            continue
+        match = re.search(r'Handlers=.*?(event\d+)', block)
+        if match:
+            return '/dev/input/' + match.group(1)
+    return None
+
+
+def fifo_thread():
+    try:
+        if os.path.exists(FIFO) and not stat_is_fifo(FIFO):
+            os.unlink(FIFO)
+        if not os.path.exists(FIFO):
+            os.mkfifo(FIFO, 0o666)
+    except OSError as exc:
+        log('fifo disabled: ' + str(exc))
+        return
+
+    while True:
+        try:
+            with open(FIFO, 'r', encoding='ascii', errors='ignore') as fifo:
+                for line in fifo:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    if parts[0] in ('pulse', 'rumble', '1'):
+                        ms = int(parts[1]) if len(parts) > 1 else DEFAULT_MS
+                        duty = int(parts[2]) if len(parts) > 2 else ACTIVE_DUTY
+                        pulse_async(ms, duty)
+        except OSError:
+            time.sleep(0.2)
+
+
+def stat_is_fifo(path):
+    import stat
+    return stat.S_ISFIFO(os.stat(path).st_mode)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ('pulse', '--pulse', 'test'):
+        setup_pwm()
+        pulse(int(sys.argv[2]) if len(sys.argv) > 2 else 120)
+        return 0
+
+    setup_pwm()
+    event_path = os.environ.get('RUMBLE_EVENT') or find_joypad_event() or '/dev/input/event4'
+    log('using pwm ' + PWM_DIR)
+    log('watching ' + event_path)
+    log('fifo ' + FIFO)
+    threading.Thread(target=fifo_thread, daemon=True).start()
+
+    fd = os.open(event_path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        while True:
+            readable, _, _ = select.select([fd], [], [], 1.0)
+            if not readable:
+                continue
+            data = os.read(fd, EVENT_STRUCT.size)
+            if len(data) != EVENT_STRUCT.size:
+                continue
+            _sec, _usec, ev_type, code, value = EVENT_STRUCT.unpack(data)
+            if ev_type == EV_KEY and value == 1 and code in TRIGGER_KEYS:
+                pulse_async(DEFAULT_MS)
+    finally:
+        try:
+            write_file(os.path.join(PWM_DIR, 'duty_cycle'), IDLE_DUTY)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

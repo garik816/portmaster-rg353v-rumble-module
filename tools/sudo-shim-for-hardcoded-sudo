@@ -1,0 +1,31 @@
+#!/bin/sh
+# Local Cave Story-evo shim for nxengine-evo's hardcoded: sudo tee /sys/.../duty_cycle
+PWM_DIR="/sys/class/pwm/pwmchip1/pwm0"
+PWM_PERIOD="${RUMBLE_PERIOD:-20000000}"
+PWM_ACTIVE="${RUMBLE_ACTIVE_DUTY:-10000000}"
+PWM_IDLE="${RUMBLE_IDLE_DUTY:-20000000}"
+
+setup_pwm() {
+  [ -d "$PWM_DIR" ] || return 1
+  echo 0 > "$PWM_DIR/enable" 2>/dev/null || true
+  echo inversed > "$PWM_DIR/polarity" 2>/dev/null || true
+  echo "$PWM_PERIOD" > "$PWM_DIR/period" 2>/dev/null || true
+  echo "$PWM_IDLE" > "$PWM_DIR/duty_cycle" 2>/dev/null || true
+  echo 1 > "$PWM_DIR/enable" 2>/dev/null || true
+}
+
+if [ "$1" = "tee" ] && [ "$2" = "$PWM_DIR/duty_cycle" ]; then
+  read value
+  case "$value" in
+    450000) mapped="$PWM_ACTIVE" ;;
+    1000000) mapped="$PWM_IDLE" ;;
+    *) mapped="$value" ;;
+  esac
+  setup_pwm
+  echo "$mapped" > "$PWM_DIR/duty_cycle"
+  echo "$mapped"
+  exit 0
+fi
+
+# This launcher already runs as root on UnofficialOS, so non-intercepted sudo calls can run directly.
+exec "$@"
