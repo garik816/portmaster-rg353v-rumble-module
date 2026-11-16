@@ -1,5 +1,8 @@
 # PortMaster RG353V PWM Rumble Module
 
+**Maintenance status:** This repository is superseded by [portmaster-rg353v-addons](https://github.com/garik816/portmaster-rg353v-addons), which contains the current rumble helper, additional mods, installer and tests. Historical instructions remain below.
+
+
 Portable rumble helper tested on Anbernic RG353V running UnofficialOS.
 
 It drives the vibration motor directly through sysfs PWM:
